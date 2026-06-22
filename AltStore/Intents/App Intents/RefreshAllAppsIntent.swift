@@ -54,26 +54,38 @@ struct InstallIPAIntent: AppIntent, ProgressReportingIntent
         self.progress.totalUnitCount = 1
     }
 
-    func perform() async throws -> some IntentResult
+    func perform() async throws -> some IntentResult & ReturnsValue<Measurement<UnitDuration>>
     {
         do
         {
             try await Self.startDatabaseIfNeeded()
 
             let temporaryDirectory = FileManager.default.uniqueTemporaryURL()
-            defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
 
             try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
 
             let ipaURL = temporaryDirectory.appendingPathComponent("App.ipa")
-            try self.ipaFile.data.write(to: ipaURL)
+            let ipaData = self.ipaFile.data
+            let estimatedInstallationTime = Self.estimatedInstallationTime(forByteCount: ipaData.count)
 
-            let intentProgress = self.progress
-            _ = try await AppManager.shared.installIPA(at: ipaURL) { progress in
-                intentProgress.addChild(progress, withPendingUnitCount: 1)
+            try ipaData.write(to: ipaURL)
+
+            Task.detached(priority: .userInitiated) {
+                defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+                do
+                {
+                    _ = try await AppManager.shared.installIPA(at: ipaURL)
+                }
+                catch
+                {
+                    print("Failed to install IPA from Shortcuts.", error)
+                }
             }
 
-            return .result()
+            self.progress.completedUnitCount = 1
+
+            return .result(value: estimatedInstallationTime)
         }
         catch
         {
@@ -86,6 +98,20 @@ struct InstallIPAIntent: AppIntent, ProgressReportingIntent
 @available(iOS 17.0, *)
 fileprivate extension InstallIPAIntent
 {
+    static func estimatedInstallationTime(forByteCount byteCount: Int) -> Measurement<UnitDuration>
+    {
+        let megabytes = Double(byteCount) / 1_048_576.0
+        let baseSeconds = 90.0
+        let secondsPerMegabyte = 0.55
+        let safetyMultiplier = 1.25
+
+        let rawEstimate = (baseSeconds + (megabytes * secondsPerMegabyte)) * safetyMultiplier
+        let roundedEstimate = ceil(rawEstimate / 60.0) * 60.0
+        let boundedEstimate = min(1_200.0, max(180.0, roundedEstimate))
+
+        return Measurement(value: boundedEstimate, unit: UnitDuration.seconds)
+    }
+
     static func startDatabaseIfNeeded() async throws
     {
         if !DatabaseManager.shared.isStarted
